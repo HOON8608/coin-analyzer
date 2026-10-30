@@ -1,40 +1,72 @@
+
 name: Build Coin Analyzer for Windows
 
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - name: Download source
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Install Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install builder
-        run: pip install pyinstaller
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pyinstaller
 
-      - name: Build executable
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name CoinAnalyzer main.py
+      - name: Build application
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name CoinAnalyzer main.py
 
       - name: Install Inno Setup
-        run: choco install innosetup --yes --no-progress
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup installation failed"
+          }
+
+      - name: Find Inno Setup compiler
+        id: inno
+        shell: pwsh
+        run: |
+          $compiler = Get-ChildItem `
+            -Path "C:\Program Files (x86)", "C:\Program Files" `
+            -Filter "ISCC.exe" -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $compiler) {
+            throw "ISCC.exe was not found"
+          }
+
+          "path=$($compiler.FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Create installer
         shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" CoinAnalyzer.iss
+          & "${{ steps.inno.outputs.path }}" "CoinAnalyzer.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installer compilation failed"
+          }
 
-      - name: Upload installer
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
           name: CoinAnalyzer-Windows-Installer
           path: Output/CoinAnalyzer_Setup.exe
+          if-no-files-found: error
           retention-days: 30
