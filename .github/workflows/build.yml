@@ -1,0 +1,40 @@
+name: Build Coin Analyzer for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download source
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install builder
+        run: pip install pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name CoinAnalyzer main.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Create installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" CoinAnalyzer.iss
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoinAnalyzer-Windows-Installer
+          path: Output/CoinAnalyzer_Setup.exe
+          retention-days: 30
