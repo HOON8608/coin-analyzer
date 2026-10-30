@@ -1,36 +1,51 @@
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 import urllib.request
+import urllib.parse
 import json
 import threading
 import time
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://api.upbit.com/v1"
+REFRESH_SECONDS = 300
+MAX_COINS = 30
 
-def get_api(path):
-    req = urllib.request.Request(
-        API + path,
-        headers={"User-Agent": "CoinAnalyzer/1.0"}
-    )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
+def api(path):
+    url = API + path
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "CoinAnalyzer/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
 
-def rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50
-    changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+def rsi(values, period=14):
+    if len(values) <= period:
+        return 50.0
+
+    changes = [values[i] - values[i-1]
+               for i in range(1, len(values))]
     gains = [max(x, 0) for x in changes]
     losses = [max(-x, 0) for x in changes]
+
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
+
     for i in range(period, len(changes)):
         avg_gain = (avg_gain * (period-1) + gains[i]) / period
         avg_loss = (avg_loss * (period-1) + losses[i]) / period
+
     if avg_loss == 0:
-        return 100 if avg_gain else 50
+        return 100.0 if avg_gain else 50.0
+
     return 100 - 100 / (1 + avg_gain / avg_loss)
 
 def ema(values, period):
@@ -40,11 +55,13 @@ def ema(values, period):
         result.append(value * k + result[-1] * (1-k))
     return result
 
-def analyze(market, ticker):
-    four = get_api(
+def analyze(ticker):
+    market = ticker["market"]
+
+    four = api(
         f"/candles/minutes/240?market={market}&count=80"
     )
-    daily = get_api(
+    daily = api(
         f"/candles/days?market={market}&count=80"
     )
 
@@ -62,15 +79,16 @@ def analyze(market, ticker):
     macd = [a-b for a, b in zip(fast, slow)]
     signal = ema(macd, 9)
 
-    cross = macd[-2] <= signal[-2] and macd[-1] > signal[-1]
+    golden = macd[-2] <= signal[-2] and macd[-1] > signal[-1]
     improving = macd[-1] > macd[-2]
 
     volumes = [x["candle_acc_trade_volume"] for x in four]
-    avg_volume = sum(volumes[-21:-1]) / 20
-    volume_ratio = volumes[-1] / avg_volume if avg_volume else 0
+    average = sum(volumes[-21:-1]) / 20
+    volume_ratio = volumes[-1] / average if average else 0
 
     high = max(x["high_price"] for x in four[-42:])
-    drawdown = (ticker["trade_price"] / high - 1) * 100
+    price = ticker["trade_price"]
+    drawdown = (price / high - 1) * 100 if high else 0
 
     score = 0
     reasons = []
@@ -83,7 +101,7 @@ def analyze(market, ticker):
         score += 1
         reasons.append("일봉 RSI 낮음")
 
-    if cross:
+    if golden:
         score += 2
         reasons.append("MACD 골든크로스")
     elif improving:
@@ -98,43 +116,56 @@ def analyze(market, ticker):
         score += 1
         reasons.append("고점 대비 조정")
 
+    change = ticker["signed_change_rate"] * 100
+
+    if change <= -12:
+        status = "위험"
+    elif score >= 5 and r4 <= 40:
+        status = "매수 관심"
+    elif score >= 3:
+        status = "관찰"
+    else:
+        status = "대기"
+
     return {
         "market": market,
-        "price": ticker["trade_price"],
-        "change": ticker["signed_change_rate"] * 100,
-        "rsi4": r4,
-        "rsid": rd,
+        "price": price,
+        "change": change,
+        "r4": r4,
+        "rd": rd,
         "score": score,
         "volume": volume_ratio,
         "drawdown": drawdown,
+        "status": status,
         "reasons": reasons
     }
 
-class CoinAnalyzer:
+class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("코인 분석실 - Upbit")
-        self.root.geometry("950x650")
-        self.root.minsize(750, 500)
-        self.busy = False
-        self.results = []
+        self.root.title("코인 분석실 | Upbit Altcoin Analyzer")
+        self.root.geometry("1050x680")
+        self.root.minsize(800, 500)
 
-        top = ttk.Frame(root, padding=12)
-        top.pack(fill="x")
+        self.results = []
+        self.busy = False
+        self.filter = tk.StringVar(value="전체")
+
+        header = ttk.Frame(root, padding=12)
+        header.pack(fill="x")
 
         ttk.Label(
-            top, text="📊 코인 분석실",
-            font=("Malgun Gothic", 19, "bold")
+            header, text="📊 코인 분석실",
+            font=("Malgun Gothic", 20, "bold")
         ).pack(side="left")
 
-        self.status = tk.StringVar(value="분석 대기 중")
-        ttk.Label(top, textvariable=self.status).pack(side="right")
+        self.status = tk.StringVar(value="시작 준비")
+        ttk.Label(header, textvariable=self.status).pack(side="right")
 
         controls = ttk.Frame(root, padding=10)
         controls.pack(fill="x")
 
-        self.filter = tk.StringVar(value="전체")
-        ttk.Label(controls, text="분류").pack(side="left")
+        ttk.Label(controls, text="분석 결과").pack(side="left")
 
         combo = ttk.Combobox(
             controls, textvariable=self.filter,
@@ -151,53 +182,65 @@ class CoinAnalyzer:
         self.scan_button.pack(side="right")
 
         columns = (
-            "coin", "price", "change", "rsi4",
-            "rsid", "score", "volume", "status"
+            "coin", "price", "change", "r4",
+            "rd", "score", "volume", "status"
         )
 
         self.table = ttk.Treeview(
             root, columns=columns, show="headings"
         )
 
-        headers = {
+        labels = {
             "coin": "코인",
-            "price": "현재가",
+            "price": "현재가(KRW)",
             "change": "24시간 변동",
-            "rsi4": "4H RSI",
-            "rsid": "일봉 RSI",
+            "r4": "4시간 RSI",
+            "rd": "일봉 RSI",
             "score": "점수",
             "volume": "거래량 배수",
             "status": "분석 결과"
         }
 
-        for col, title in headers.items():
-            self.table.heading(col, text=title)
-            self.table.column(col, width=105, anchor="center")
+        for key, label in labels.items():
+            self.table.heading(key, text=label)
+            self.table.column(key, width=120, anchor="center")
 
-        self.table.pack(fill="both", expand=True, padx=12, pady=8)
+        self.table.pack(
+            fill="both", expand=True, padx=12, pady=8
+        )
+        self.table.bind("<<TreeviewSelect>>", self.show_detail)
 
-        self.details = tk.Text(root, height=7, wrap="word")
-        self.details.pack(fill="x", padx=12, pady=8)
+        self.detail = tk.Text(root, height=7, wrap="word")
+        self.detail.pack(fill="x", padx=12, pady=8)
 
         self.progress = ttk.Progressbar(root, mode="determinate")
         self.progress.pack(fill="x", padx=12, pady=5)
 
-        self.root.after(300000, self.auto_refresh)
-        self.start_scan()
+        ttk.Label(
+            root,
+            text="공개 시세 기반 참고 분석 | 자동매매 기능 없음",
+            foreground="gray"
+        ).pack(pady=5)
+
+        self.root.after(1000, self.start_scan)
+        self.root.after(REFRESH_SECONDS * 1000, self.auto_refresh)
 
     def start_scan(self):
         if self.busy:
             return
+
         self.busy = True
         self.scan_button.configure(state="disabled")
-        self.status.set("업비트 시세 수집 및 분석 중...")
+        self.status.set("업비트 시세 수집 중...")
+
         threading.Thread(
             target=self.scan, daemon=True
         ).start()
 
     def scan(self):
+        results = []
         try:
-            markets = get_api("/market/all?isDetails=false")
+            markets = api("/market/all?isDetails=false")
             names = [
                 x["market"] for x in markets
                 if x["market"].startswith("KRW-")
@@ -206,16 +249,16 @@ class CoinAnalyzer:
 
             tickers = []
             for i in range(0, len(names), 50):
-                tickers += get_api(
-                    "/ticker?markets=" + ",".join(names[i:i+50])
+                query = urllib.parse.urlencode(
+                    {"markets": ",".join(names[i:i+50])}
                 )
+                tickers.extend(api("/ticker?" + query))
 
             tickers.sort(
                 key=lambda x: x["acc_trade_price_24h"],
                 reverse=True
             )
-            selected = tickers[:30]
-            results = []
+            selected = tickers[:MAX_COINS]
 
             self.root.after(
                 0, lambda: self.progress.configure(
@@ -223,93 +266,103 @@ class CoinAnalyzer:
                 )
             )
 
-            def work(item):
-                try:
-                    return analyze(item["market"], item)
-                except Exception:
-                    return None
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {
+                    pool.submit(analyze, item): item
+                    for item in selected
+                }
 
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                futures = [pool.submit(work, x) for x in selected]
-                for i, future in enumerate(futures):
-                    result = future.result()
-                    if result:
-                        results.append(result)
+                for index, future in enumerate(as_completed(futures), 1):
+                    try:
+                        results.append(future.result())
+                    except Exception:
+                        pass
+
                     self.root.after(
-                        0, lambda n=i+1:
+                        0, lambda n=index:
                         self.progress.configure(value=n)
                     )
 
             results.sort(
-                key=lambda x: (-x["score"], x["change"])
+                key=lambda x: (-x["score"], -x["volume"])
             )
 
             self.results = results
+            now = datetime.now().strftime("%H:%M:%S")
+
             self.root.after(0, self.render)
             self.root.after(
                 0, lambda: self.status.set(
-                    "분석 완료 · " +
-                    datetime.now().strftime("%H:%M:%S")
+                    f"분석 완료 {now} | 성공 {len(results)}종목"
                 )
             )
 
-        except Exception as e:
+        except Exception as error:
+            message = str(error)[:120]
             self.root.after(
-                0, lambda: self.status.set(
-                    "연결 오류: " + str(e)[:80]
-                )
+                0, lambda: self.status.set("연결 오류: " + message)
             )
+
         finally:
             self.busy = False
             self.root.after(
-                0, lambda: self.scan_button.configure(
-                    state="normal"
-                )
+                0, lambda: self.scan_button.configure(state="normal")
             )
 
     def render(self):
         self.table.delete(*self.table.get_children())
-        self.details.delete("1.0", "end")
 
-        count = 0
         for x in self.results:
-            if x["score"] >= 5 and x["rsi4"] <= 40:
-                status = "매수 관심"
-            elif x["score"] >= 3:
-                status = "관찰"
-            else:
-                status = "대기"
-
-            if x["change"] <= -12:
-                status = "위험"
-
-            if self.filter.get() != "전체" and self.filter.get() != status:
+            if self.filter.get() not in ("전체", x["status"]):
                 continue
 
-            count += 1
             self.table.insert("", "end", values=(
                 x["market"].replace("KRW-", ""),
                 f'{x["price"]:,.0f}',
                 f'{x["change"]:+.2f}%',
-                f'{x["rsi4"]:.1f}',
-                f'{x["rsid"]:.1f}',
+                f'{x["r4"]:.1f}',
+                f'{x["rd"]:.1f}',
                 f'{x["score"]}/7',
                 f'{x["volume"]:.2f}배',
-                status
+                x["status"]
             ))
 
-        self.details.insert(
+    def show_detail(self, event=None):
+        selected = self.table.selection()
+        if not selected:
+            return
+
+        coin = self.table.item(selected[0])["values"][0]
+        item = next(
+            (x for x in self.results
+             if x["market"] == "KRW-" + coin),
+            None
+        )
+        if not item:
+            return
+
+        self.detail.delete("1.0", "end")
+        reasons = ", ".join(item["reasons"]) or "특별한 조건 없음"
+
+        self.detail.insert(
             "end",
-            f"분석 종목 {count}개\n"
-            "RSI·MACD·거래량을 종합한 참고 지표입니다.\n"
-            "매수 관심은 실제 매수 추천이나 수익 보장이 아닙니다."
+            f'{coin} 분석 상세\n'
+            f'4시간 RSI: {item["r4"]:.1f} | '
+            f'일봉 RSI: {item["rd"]:.1f}\n'
+            f'고점 대비: {item["drawdown"]:.2f}% | '
+            f'거래량: {item["volume"]:.2f}배\n'
+            f'감지 조건: {reasons}\n'
+            f'판정: {item["status"]}\n'
+            '기술적 참고 정보이며 매수 추천이나 수익 보장이 아닙니다.'
         )
 
     def auto_refresh(self):
         self.start_scan()
-        self.root.after(300000, self.auto_refresh)
+        self.root.after(
+            REFRESH_SECONDS * 1000, self.auto_refresh
+        )
 
 if __name__ == "__main__":
-    window = tk.Tk()
-    app = CoinAnalyzer(window)
-    window.mainloop()
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
